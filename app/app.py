@@ -22,6 +22,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 from PIL import Image
+import shutil
+import uuid
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -39,6 +41,7 @@ except Exception:
 
 
 PROCESSED_DATASET_DIR = PROJECT_ROOT / "data" / "processed"
+PROCESSED_VERIFIED_DIR = PROJECT_ROOT / "data" / "verified"
 
 
 def _read_image_from_path(image_path: Path) -> np.ndarray:
@@ -271,27 +274,45 @@ def _build_character_database_from_processed_images(text: str) -> dict[str, List
     engine can sample stylistic variants during generation.
     """
 
+    # If an in-session verified DB exists, prefer it (fast)
     verified_character_db = st.session_state.get("pensync_char_db")
     if isinstance(verified_character_db, dict) and verified_character_db:
         return verified_character_db
 
-    available_paths = _load_processed_character_paths(PROCESSED_DATASET_DIR)
-    if not available_paths:
-        return {}
+    character_db: dict[str, List[np.ndarray]] = {}
+    allowed_characters = set(text) | set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
 
+    # 1) Load persisted verified samples from data/verified/<label>/*.png
+    if PROCESSED_VERIFIED_DIR.exists():
+        for label_dir in sorted(PROCESSED_VERIFIED_DIR.iterdir()):
+            if not label_dir.is_dir():
+                continue
+            label = label_dir.name
+            if label not in allowed_characters:
+                continue
+            for img_path in sorted(label_dir.glob("*.png")):
+                try:
+                    img = _prepare_prediction_character(_load_image_from_path(img_path))
+                    character_db.setdefault(label, []).append(img)
+                except Exception:
+                    continue
+
+    # 2) For labels not covered by verified samples, use model predictions on processed dataset
     try:
         model = load_cnn_model()
     except Exception:
-        return {}
+        return character_db
 
-    character_db: dict[str, List[np.ndarray]] = {}
-    allowed_characters = set(text) | set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+    available_paths = _load_processed_character_paths(PROCESSED_DATASET_DIR)
+    if not available_paths:
+        return character_db
 
     for image_path in available_paths:
         try:
             character_image = _prepare_prediction_character(_load_image_from_path(image_path))
             predicted_character = predict_character(model, character_image)
-            if predicted_character in allowed_characters:
+            # Only add to db if that label isn't already satisfied by verified samples
+            if predicted_character in allowed_characters and predicted_character not in character_db:
                 character_db.setdefault(predicted_character, []).append(character_image)
         except Exception:
             continue
@@ -364,6 +385,32 @@ def _render_hitl_verification_grid() -> None:
         st.session_state["pensync_verified_labels"] = verified_labels
         st.session_state["pensync_char_db"] = verified_character_db
         st.success(f"Saved {len(verified_labels)} corrected labels into the compositor database.")
+
+    if st.button("Save Verified Dataset"):
+        # Move files into data/verified/<label>/ and update session DB
+        saved_map: dict[str, str] = {}
+        PROCESSED_VERIFIED_DIR.mkdir(parents=True, exist_ok=True)
+        for entry in verification_entries:
+            widget_key = str(entry["widget_key"])
+            predicted_label = str(entry["predicted_label"])
+            corrected_label = _sanitize_single_character_label(st.session_state.get(widget_key, predicted_label), predicted_label)
+            src_path: Path = entry["path"]
+            dest_dir = PROCESSED_VERIFIED_DIR / corrected_label
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            # Ensure unique filename to avoid collisions
+            dest_path = dest_dir / src_path.name
+            if dest_path.exists():
+                dest_path = dest_dir / f"{src_path.stem}_{uuid.uuid4().hex}{src_path.suffix}"
+            try:
+                shutil.move(str(src_path), str(dest_path))
+                saved_map[str(dest_path)] = corrected_label
+            except Exception as exc:
+                st.warning(f"Failed to move {src_path.name}: {exc}")
+
+        verified_character_db = _build_character_database_from_verified_labels(saved_map)
+        st.session_state["pensync_verified_labels"] = saved_map
+        st.session_state["pensync_char_db"] = verified_character_db
+        st.success(f"Persisted {len(saved_map)} verified samples to {PROCESSED_VERIFIED_DIR.as_posix()}")
 
 
 def _page_to_png_bytes(page: np.ndarray) -> bytes:
