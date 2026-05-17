@@ -242,7 +242,7 @@ def extract_normalized_characters(
     return normalized_characters
 
 
-def extract_contours(binary_image: np.ndarray, min_area: int = 25) -> List[ContourBox]:
+def extract_contours(binary_image: np.ndarray, min_area: int = 25, min_height: int = 6) -> List[ContourBox]:
     """Extract handwriting candidate regions from a binary image.
 
     Contours are useful because handwriting strokes form connected foreground
@@ -269,7 +269,13 @@ def extract_contours(binary_image: np.ndarray, min_area: int = 25) -> List[Conto
     if binary_image.ndim != 2:
         raise ValueError("Contour extraction expects a single-channel binary image.")
 
-    contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Detect contours on a vertically closed copy so i/j dots join their stems
+    # without changing the crisp image that downstream crops are taken from.
+    smeared_image = binary_image.copy()
+    kernel = np.ones((9, 3), np.uint8)
+    smeared_image = cv2.morphologyEx(smeared_image, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(smeared_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     contour_boxes: List[ContourBox] = []
     for contour in contours:
@@ -278,6 +284,8 @@ def extract_contours(binary_image: np.ndarray, min_area: int = 25) -> List[Conto
             continue
 
         x, y, width, height = cv2.boundingRect(contour)
+        if height < min_height:
+            continue
         contour_boxes.append(
             ContourBox(
                 x=int(x),

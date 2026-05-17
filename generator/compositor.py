@@ -16,6 +16,28 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 
+def get_safe_label(char: str) -> str:
+    """Return a filesystem-safe label for a character with explicit case separation."""
+
+    if not char:
+        return ""
+
+    symbol = char[0]
+    if symbol.isupper():
+        return f"upper_{symbol}"
+    if symbol.islower():
+        return f"lower_{symbol}"
+    if symbol.isdigit():
+        return symbol
+    return f"sym_{ord(symbol)}"
+
+
+small_letters = "aceimnorsuvwxz"
+ascender_letters = "bdfhklt"
+descender_letters = "gjpqy"
+tiny_punctuation = ".,"
+
+
 def _render_fallback_character(character: str, size: int = 64) -> np.ndarray:
     """Render a high-definition fallback glyph using TrueType fonts.
     
@@ -71,24 +93,36 @@ def _resolve_variant(char_db: Dict[str, List[np.ndarray]], character: str) -> np
     synthetic PIL rendering. This solves EMNIST ByClass case confusion.
     """
 
+    safe_character = get_safe_label(character)
+
     # Priority 1: Exact character match (preferred)
-    direct_variants = char_db.get(character)
+    direct_variants = char_db.get(safe_character)
     if direct_variants:
         return direct_variants[int(np.random.randint(0, len(direct_variants)))]
 
     # Priority 2: Smart case fallback (uppercase ↔ lowercase from database)
     swapped_case = character.swapcase()
-    swapped_variants = char_db.get(swapped_case)
+    swapped_variants = char_db.get(get_safe_label(swapped_case))
     if swapped_variants:
         # Use the database variant BEFORE synthetic rendering
         return swapped_variants[int(np.random.randint(0, len(swapped_variants)))]
 
-    # Priority 3: Pool any available variant (low fidelity but better than nothing)
+    # Priority 3: Synthetic fallback for the requested character — keep glyph identity
+    # This ensures the generated page visually matches the input text even when the
+    # user's database lacks that exact label. Pooling from unrelated variants can
+    # produce the wrong letters (e.g. lots of 'B' or 'W'); so we prefer a clean
+    # synthetic glyph first and only fall back to pooling as a last resort.
+    try:
+        return _render_fallback_character(character)
+    except Exception:
+        pass
+
+    # Priority 4: Pool any available variant (low fidelity but better than nothing)
     pooled_variants = [variant for variants in char_db.values() for variant in variants]
     if pooled_variants:
         return pooled_variants[int(np.random.randint(0, len(pooled_variants)))]
 
-    # Priority 4: Synthetic fallback (only if database is empty)
+    # If everything else fails, render a synthetic glyph (defensive)
     return _render_fallback_character(character)
 
 
@@ -106,34 +140,46 @@ def _extract_ink_mask(character_image: np.ndarray) -> np.ndarray:
     return np.clip(alpha, 0.0, 1.0)
 
 
-def _prepare_character_patch(character_image: np.ndarray, target_height: int = 56) -> tuple[np.ndarray, np.ndarray]:
-    """Crop and resize a character patch using LANCZOS for HD anti-aliased scaling.
+def _thin_character_strokes(character_image: np.ndarray) -> np.ndarray:
+    """Thin black ink slightly before mask generation while keeping white paper intact."""
+
+    if character_image.ndim == 3:
+        character_image = cv2.cvtColor(character_image, cv2.COLOR_BGR2GRAY)
+
+    kernel = np.ones((2, 2), np.uint8)
+    return cv2.dilate(character_image, kernel, iterations=1)
+
+
+def _prepare_character_patch(
+    character_image: np.ndarray,
+    target_height: int = 56,
+    thin_strokes: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resize a character patch proportionally using LANCZOS for HD anti-aliased scaling.
     
     Uses PIL's high-quality LANCZOS resampling to ensure smooth edges and prevent
     pixelation, especially important for synthesized output.
     """
 
-    mask = _extract_ink_mask(character_image)
-    foreground = np.argwhere(mask > 0.05)
-    if foreground.size == 0:
-        return np.zeros((1, 1), dtype=np.uint8), np.zeros((1, 1), dtype=np.float32)
+    if thin_strokes:
+        character_image = _thin_character_strokes(character_image)
 
-    top, left = foreground.min(axis=0)
-    bottom, right = foreground.max(axis=0) + 1
-    cropped_image = character_image[top:bottom, left:right]
-    cropped_mask = mask[top:bottom, left:right]
+    if character_image.ndim != 2:
+        raise ValueError("Character patches must be single-channel grayscale arrays.")
 
-    height, width = cropped_image.shape[:2]
+    height, width = character_image.shape[:2]
     if height <= 0 or width <= 0:
         return np.zeros((1, 1), dtype=np.uint8), np.zeros((1, 1), dtype=np.float32)
 
     scale = target_height / float(height)
     target_width = max(1, int(round(width * scale)))
+    target_height = max(1, int(round(height * scale)))
 
     # Use PIL's LANCZOS for high-quality anti-aliased scaling
     # Convert image to PIL, resize, and convert back
-    pil_image = Image.fromarray(cropped_image)
-    pil_mask_image = Image.fromarray((cropped_mask * 255).astype(np.uint8))
+    pil_image = Image.fromarray(character_image)
+    mask = _extract_ink_mask(character_image)
+    pil_mask_image = Image.fromarray((mask * 255).astype(np.uint8))
     
     try:
         # Try LANCZOS (high-quality, available in Pillow 10.0+)
@@ -150,11 +196,16 @@ def _prepare_character_patch(character_image: np.ndarray, target_height: int = 5
     return resized_image, np.clip(resized_mask, 0.0, 1.0)
 
 
-def _blend_character(page: np.ndarray, x: int, y: int, character_image: np.ndarray) -> int:
+def _blend_character(
+    page: np.ndarray,
+    x: int,
+    y: int,
+    character_image: np.ndarray,
+    target_height: int,
+) -> int:
     """Blend one character into the page at the requested coordinates."""
 
-    ink_color = int(np.random.randint(10, 35))
-    character_patch, ink_mask = _prepare_character_patch(character_image)
+    character_patch, ink_mask = _prepare_character_patch(character_image, target_height=target_height)
     patch_height, patch_width = character_patch.shape[:2]
 
     page_height, page_width = page.shape[:2]
@@ -169,10 +220,88 @@ def _blend_character(page: np.ndarray, x: int, y: int, character_image: np.ndarr
     ink_mask = ink_mask[:available_height, :available_width]
     page_region = page[y : y + available_height, x : x + available_width].astype(np.float32)
 
-    ink_layer = np.full_like(page_region, fill_value=float(ink_color))
-    blended = page_region * (1.0 - ink_mask) + ink_layer * ink_mask
+    blue_layer = np.zeros_like(page_region, dtype=np.float32)
+    blue_layer[..., 2] = 139.0
+    alpha = ink_mask[..., np.newaxis]
+    blended = page_region * (1.0 - alpha) + blue_layer * alpha
     page[y : y + available_height, x : x + available_width] = np.clip(blended, 0, 255).astype(np.uint8)
     return available_width
+
+
+def _get_typographic_settings(character: str, line_height: int) -> tuple[int, int]:
+    """Return a per-character render height and vertical offset within the line box."""
+
+    if not character or character == " " or character == "\n" or character == "\r":
+        return line_height, 0
+
+    if character in tiny_punctuation:
+        target_height = max(1, int(round(line_height * 0.10)))
+        y_offset = int(round(line_height * 0.90))
+        return target_height, y_offset
+
+    if character in small_letters:
+        target_height = max(1, int(round(line_height * 0.45)))
+        y_offset = int(round(line_height * 0.55))
+        return target_height, y_offset
+
+    if character in descender_letters:
+        target_height = max(1, int(round(line_height * 0.65)))
+        y_offset = int(round(line_height * 0.55))
+        return target_height, y_offset
+
+    if character in ascender_letters or character.isupper() or character.isdigit():
+        return line_height, 0
+
+    return line_height, 0
+
+
+def _estimate_character_width(character: str, line_height: int) -> int:
+    """Estimate the rendered width for one character at the current typographic scale."""
+
+    if not character or character == "\r" or character == "\n":
+        return 0
+
+    if character == " ":
+        return int(round(line_height * 0.4))
+
+    target_height, _ = _get_typographic_settings(character, line_height)
+    scale = target_height / float(line_height)
+    base_width = line_height
+    if character in tiny_punctuation:
+        base_width = max(1, int(round(line_height * 0.18)))
+    elif character in small_letters:
+        base_width = max(1, int(round(line_height * 0.55)))
+    elif character in descender_letters:
+        base_width = max(1, int(round(line_height * 0.58)))
+    elif character in ascender_letters or character.isupper() or character.isdigit():
+        base_width = line_height
+    else:
+        base_width = max(1, int(round(line_height * 0.65)))
+
+    return max(1, int(round(base_width * scale)))
+
+
+def _estimate_word_width(word: str, line_height: int) -> int:
+    """Estimate the width a word will occupy before drawing it."""
+
+    if not word:
+        return 0
+
+    width = 0
+    drawable_char_count = 0
+    for character in word:
+        if character in "\r\n":
+            continue
+        if character == " ":
+            width += _estimate_character_width(character, line_height)
+            continue
+        width += _estimate_character_width(character, line_height)
+        drawable_char_count += 1
+
+    if drawable_char_count > 1:
+        width += int(np.random.randint(2, 6)) * (drawable_char_count - 1)
+
+    return width
 
 
 def generate_handwritten_page(
@@ -205,50 +334,76 @@ def generate_handwritten_page(
     """
 
     page_width, page_height = page_size
-    page = np.full((page_height, page_width), 255, dtype=np.uint8)
+    page = np.full((page_height, page_width, 3), 255, dtype=np.uint8)
 
     left_margin = 60
     right_margin = 60
     top_margin = 80
     bottom_margin = 80
-    line_height = 72
-    space_advance = 24
+    line_height = 58
+    line_step = int(round(line_height * 1.5))
+    space_advance = int(round(line_height * 0.42))
 
-    x = left_margin
-    y = top_margin
+    current_x = left_margin
+    current_y = top_margin
 
-    for character in text:
-        if character == "\r":
-            continue
-
-        if character == "\n":
-            x = left_margin
-            y += line_height
-            continue
-
-        if y > page_height - bottom_margin:
+    words = text.split(" ")
+    for word_index, word in enumerate(words):
+        if current_y > page_height - bottom_margin:
             break
 
-        if character == " ":
-            x += int(max(12, space_advance + np.random.normal(loc=0.0, scale=4.0)))
-            if x > page_width - right_margin:
-                x = left_margin
-                y += line_height
-            continue
+        if "\n" in word or "\r" in word:
+            sublines = word.splitlines()
+        else:
+            sublines = [word]
 
-        if x > page_width - right_margin - 80:
-            x = left_margin
-            y += line_height
+        for subline_index, subline in enumerate(sublines):
+            if subline_index > 0:
+                current_x = left_margin
+                current_y += line_step
+                if current_y > page_height - bottom_margin:
+                    break
 
-        selected_variant = _resolve_variant(char_db, character)
-        baseline_jitter = int(np.random.randint(-3, 3))
-        paste_y = max(0, y + baseline_jitter)
-        pasted_width = _blend_character(page, x, paste_y, selected_variant)
+            if not subline:
+                continue
 
-        if pasted_width <= 0:
-            x += int(max(10, space_advance + np.random.normal(loc=0.0, scale=3.0)))
-            continue
+            word_width = _estimate_word_width(subline, line_height)
+            if current_x + word_width > page_width - right_margin:
+                current_x = left_margin
+                current_y += line_step
 
-        x += pasted_width + int(max(6, np.random.normal(loc=8.0, scale=3.0)))
+            for character in subline:
+                if character in "\r\n" or character == " ":
+                    continue
+
+                if current_y > page_height - bottom_margin:
+                    break
+
+                selected_variant = _resolve_variant(char_db, character)
+                target_height, typographic_offset = _get_typographic_settings(character, line_height)
+                baseline_jitter = int(np.random.randint(-3, 3))
+                paste_y = max(0, current_y + typographic_offset + baseline_jitter)
+                pasted_width = _blend_character(
+                    page,
+                    current_x,
+                    paste_y,
+                    selected_variant,
+                    target_height=target_height,
+                )
+
+                if pasted_width <= 0:
+                    current_x += int(np.random.randint(2, 6))
+                    continue
+
+                current_x += pasted_width + int(np.random.randint(2, 6))
+
+            if current_y > page_height - bottom_margin:
+                break
+
+        if word_index < len(words) - 1:
+            current_x += space_advance
+            if current_x > page_width - right_margin:
+                current_x = left_margin
+                current_y += line_step
 
     return page

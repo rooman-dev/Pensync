@@ -1,0 +1,6 @@
+tensorflow>=2.16.1,<2.19
+opencv-python>=4.10,<5
+streamlit>=1.36,<2
+scikit-learn>=1.5,<2
+numpy>=1.26,<3
+pillow>=10.4,<11
