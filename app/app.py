@@ -208,6 +208,15 @@ def _load_image_from_path(image_path: Path) -> np.ndarray:
     return image
 
 
+def _sanitize_single_character_label(label: str, fallback: str) -> str:
+    """Normalize a correction label to a single EMNIST character."""
+
+    normalized_label = (label or "").strip()
+    if not normalized_label:
+        return fallback
+    return normalized_label[0]
+
+
 def _prepare_prediction_character(image: np.ndarray) -> np.ndarray:
     """Normalize a candidate character image into the 64x64 CNN input format.
 
@@ -233,6 +242,26 @@ def _display_prediction_block(character_image: np.ndarray, prediction_text: str)
         st.caption("This prediction comes from the trained EMNIST byclass CNN classifier.")
 
 
+def _build_character_database_from_verified_labels(verified_labels: dict[str, str]) -> dict[str, List[np.ndarray]]:
+    """Rebuild the character database from user-verified labels in session state."""
+
+    verified_character_db: dict[str, List[np.ndarray]] = {}
+
+    for path_text, label in verified_labels.items():
+        image_path = Path(path_text)
+        if not image_path.exists() or not label:
+            continue
+
+        try:
+            character_image = _prepare_prediction_character(_load_image_from_path(image_path))
+        except Exception:
+            continue
+
+        verified_character_db.setdefault(label, []).append(character_image)
+
+    return verified_character_db
+
+
 def _build_character_database_from_processed_images(text: str) -> dict[str, List[np.ndarray]]:
     """Build a character database by predicting labels for saved character crops.
 
@@ -241,6 +270,10 @@ def _build_character_database_from_processed_images(text: str) -> dict[str, List
     not available yet. Predicted samples are grouped by character so the layout
     engine can sample stylistic variants during generation.
     """
+
+    verified_character_db = st.session_state.get("pensync_char_db")
+    if isinstance(verified_character_db, dict) and verified_character_db:
+        return verified_character_db
 
     available_paths = _load_processed_character_paths(PROCESSED_DATASET_DIR)
     if not available_paths:
@@ -264,6 +297,73 @@ def _build_character_database_from_processed_images(text: str) -> dict[str, List
             continue
 
     return character_db
+
+
+def _render_hitl_verification_grid() -> None:
+    """Display saved characters with CNN predictions and user correction inputs."""
+
+    available_paths = _load_processed_character_paths(PROCESSED_DATASET_DIR)
+    if not available_paths:
+        st.info("No saved characters were found in data/processed yet. Save extracted characters first.")
+        return
+
+    try:
+        model = load_cnn_model()
+    except Exception as exc:
+        st.warning(f"CNN model could not be loaded for verification: {exc}")
+        return
+
+    verification_entries: List[dict[str, object]] = []
+    for image_path in available_paths:
+        try:
+            original_image = _load_image_from_path(image_path)
+            prediction_image = _prepare_prediction_character(original_image)
+            predicted_label = predict_character(model, prediction_image)
+            verification_entries.append(
+                {
+                    "path": image_path,
+                    "image": prediction_image,
+                    "predicted_label": predicted_label,
+                    "widget_key": f"hitl_label_{image_path.stem}",
+                }
+            )
+        except Exception:
+            continue
+
+    if not verification_entries:
+        st.info("No readable character crops were available for verification.")
+        return
+
+    columns_per_row = 4
+    for row_start in range(0, len(verification_entries), columns_per_row):
+        row_entries = verification_entries[row_start : row_start + columns_per_row]
+        columns = st.columns(columns_per_row)
+        for column_index, entry in enumerate(row_entries):
+            with columns[column_index]:
+                st.image(entry["image"], clamp=True, channels="GRAY", use_container_width=True)
+                st.caption(f"CNN prediction: {entry['predicted_label']}")
+                st.text_input(
+                    "Correct label",
+                    value=str(entry["predicted_label"]),
+                    max_chars=1,
+                    key=str(entry["widget_key"]),
+                    label_visibility="collapsed",
+                    help="Overtype the CNN label if it is wrong.",
+                )
+                st.caption(entry["path"].name)
+
+    if st.button("Save Corrections", type="primary"):
+        verified_labels: dict[str, str] = {}
+        for entry in verification_entries:
+            widget_key = str(entry["widget_key"])
+            predicted_label = str(entry["predicted_label"])
+            corrected_label = _sanitize_single_character_label(st.session_state.get(widget_key, predicted_label), predicted_label)
+            verified_labels[str(entry["path"])] = corrected_label
+
+        verified_character_db = _build_character_database_from_verified_labels(verified_labels)
+        st.session_state["pensync_verified_labels"] = verified_labels
+        st.session_state["pensync_char_db"] = verified_character_db
+        st.success(f"Saved {len(verified_labels)} corrected labels into the compositor database.")
 
 
 def _page_to_png_bytes(page: np.ndarray) -> bytes:
@@ -434,6 +534,12 @@ def main() -> None:
                 st.code(summary_buffer.getvalue(), language="text")
             except Exception as exc:
                 st.warning(f"CNN model could not be initialized in this environment: {exc}")
+
+            st.subheader("Human-in-the-Loop: Verify & Correct Labels")
+            st.caption(
+                "Review the CNN's guesses for saved character crops, correct any mistakes, and save the verified labels for synthesis."
+            )
+            _render_hitl_verification_grid()
 
             st.subheader("Live Prediction")
             prediction_source = st.radio(
