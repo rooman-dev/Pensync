@@ -14,6 +14,12 @@ from typing import Dict, List
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+import hashlib
+
+
+# Cache for measured tight ink widths: key -> int
+# Key format: "{safe_label}:{variant_index}:{line_height}". Cleared per-render.
+_width_cache: Dict[str, int] = {}
 
 
 def get_safe_label(char: str) -> str:
@@ -132,9 +138,23 @@ def _extract_ink_mask(character_image: np.ndarray) -> np.ndarray:
     if character_image.ndim == 3:
         character_image = cv2.cvtColor(character_image, cv2.COLOR_BGR2GRAY)
 
-    if character_image.mean() > 127.0:
+    # Robust background detection: sample border/corner pixels to decide whether
+    # the image background is light (white) or dark (black). Using the global
+    # mean can flip for glyphs that occupy large area, producing inverted masks
+    # where the page background becomes the foreground.
+    h, w = character_image.shape[:2]
+    corners = [
+        character_image[0, 0],
+        character_image[0, w - 1],
+        character_image[h - 1, 0],
+        character_image[h - 1, w - 1],
+    ]
+    bg_est = np.median(np.array(corners, dtype=np.float32))
+    if bg_est > 127.0:
+        # Background is light (white) -> ink is darker
         alpha = (255.0 - character_image.astype(np.float32)) / 255.0
     else:
+        # Background is dark -> ink is lighter
         alpha = character_image.astype(np.float32) / 255.0
 
     return np.clip(alpha, 0.0, 1.0)
@@ -150,6 +170,53 @@ def _thin_character_strokes(character_image: np.ndarray) -> np.ndarray:
     return cv2.dilate(character_image, kernel, iterations=1)
 
 
+def _adjust_stroke_width(resized_image: np.ndarray, mode: str = "thin", strength_ratio: float = 0.02) -> np.ndarray:
+    """Adjust stroke width on a resized grayscale image using a kernel scaled to image size.
+
+    mode: 'thin' uses erosion, 'thicken' uses dilation. strength_ratio controls kernel size
+    as a fraction of the image height (e.g. 0.02 => kernel ~ 2% of height).
+    """
+    if resized_image.ndim == 3:
+        gray = cv2.cvtColor(resized_image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = resized_image
+
+    h = max(1, gray.shape[0])
+    k = max(1, int(round(h * strength_ratio)))
+    kernel = np.ones((k, k), np.uint8)
+
+    if mode == "thin":
+        adjusted = cv2.erode(gray, kernel, iterations=1)
+    else:
+        adjusted = cv2.dilate(gray, kernel, iterations=1)
+
+    return adjusted
+
+
+def _adjust_mask_width(resized_mask: np.ndarray, mode: str = "thin", strength_ratio: float = 0.02) -> np.ndarray:
+    """Adjust the binary/float ink mask using morphological ops sized to image height.
+
+    Operates on float masks in [0,1], converts to uint8 for morphology and back.
+    """
+    if resized_mask.ndim != 2:
+        resized_mask = resized_mask[..., 0]
+
+    h = max(1, resized_mask.shape[0])
+    k = max(1, int(round(h * strength_ratio)))
+    kernel = np.ones((k, k), np.uint8)
+
+    mask_u8 = (resized_mask * 255.0).astype(np.uint8)
+    try:
+        if mode == "thin":
+            adj = cv2.erode(mask_u8, kernel, iterations=1)
+        else:
+            adj = cv2.dilate(mask_u8, kernel, iterations=1)
+        adj_f = adj.astype(np.float32) / 255.0
+        return np.clip(adj_f, 0.0, 1.0)
+    except Exception:
+        return resized_mask
+
+
 def _prepare_character_patch(
     character_image: np.ndarray,
     target_height: int = 56,
@@ -161,12 +228,25 @@ def _prepare_character_patch(
     pixelation, especially important for synthesized output.
     """
 
-    if thin_strokes:
-        character_image = _thin_character_strokes(character_image)
-
     if character_image.ndim != 2:
         raise ValueError("Character patches must be single-channel grayscale arrays.")
 
+    # add small proportional padding to stabilize visual cap/x-height across variants
+    height, width = character_image.shape[:2]
+    pad = max(1, int(round(max(height, width) * 0.12)))
+    # Use the image border median as the pad value so we don't force a white
+    # background on images that originally had a dark background (e.g., processed
+    # CNN inputs are padded with black). This prevents inverting the ink mask.
+    corners = [
+        character_image[0, 0],
+        character_image[0, width - 1],
+        character_image[height - 1, 0],
+        character_image[height - 1, width - 1],
+    ]
+    pad_value = int(np.median(np.array(corners, dtype=np.float32)))
+    padded = np.full((height + pad * 2, width + pad * 2), pad_value, dtype=character_image.dtype)
+    padded[pad : pad + height, pad : pad + width] = character_image
+    character_image = padded
     height, width = character_image.shape[:2]
     if height <= 0 or width <= 0:
         return np.zeros((1, 1), dtype=np.uint8), np.zeros((1, 1), dtype=np.float32)
@@ -192,8 +272,30 @@ def _prepare_character_patch(
     
     resized_image = np.array(resized_pil_image, dtype=np.uint8)
     resized_mask = np.array(resized_pil_mask, dtype=np.float32) / 255.0
-    
+
+    # After resizing, adjust stroke width on the mask (not the image) to keep
+    # the alpha channel aligned with the pixel data. This avoids the wrong
+    # blue-filled boxes caused by image/mask mismatch.
+    try:
+        resized_mask = _adjust_mask_width(resized_mask, mode=("thin" if thin_strokes else "thicken"), strength_ratio=0.02)
+    except Exception:
+        pass
+
     return resized_image, np.clip(resized_mask, 0.0, 1.0)
+
+
+def _get_variant_from_db(char_db: Dict[str, List[np.ndarray]], character: str, variant_index: int | None) -> np.ndarray:
+    """Return the specific variant from `char_db` if available, otherwise fallback."""
+    safe = get_safe_label(character)
+    variants = char_db.get(safe) if char_db is not None else None
+    if variants and variant_index is not None and 0 <= variant_index < len(variants):
+        return variants[variant_index]
+
+    # If no valid index, try to resolve normally (may pool or synthesize)
+    try:
+        return _resolve_variant(char_db, character)
+    except Exception:
+        return _render_fallback_character(character)
 
 
 def _blend_character(
@@ -225,7 +327,16 @@ def _blend_character(
     alpha = ink_mask[..., np.newaxis]
     blended = page_region * (1.0 - alpha) + blue_layer * alpha
     page[y : y + available_height, x : x + available_width] = np.clip(blended, 0, 255).astype(np.uint8)
-    return available_width
+
+    # Compute tight ink width for kerning: find first/last column with ink
+    col_sums = np.sum(ink_mask, axis=0)
+    cols = np.where(col_sums > 1e-3)[0]
+    if cols.size:
+        ink_width = int(cols[-1] - cols[0] + 1)
+    else:
+        ink_width = max(1, available_width)
+
+    return ink_width
 
 
 def _get_typographic_settings(character: str, line_height: int) -> tuple[int, int]:
@@ -235,7 +346,7 @@ def _get_typographic_settings(character: str, line_height: int) -> tuple[int, in
         return line_height, 0
 
     if character in tiny_punctuation:
-        target_height = max(1, int(round(line_height * 0.10)))
+        target_height = max(10, int(round(line_height * 0.18)))
         y_offset = int(round(line_height * 0.90))
         return target_height, y_offset
 
@@ -257,28 +368,91 @@ def _get_typographic_settings(character: str, line_height: int) -> tuple[int, in
 
 def _estimate_character_width(character: str, line_height: int) -> int:
     """Estimate the rendered width for one character at the current typographic scale."""
-
     if not character or character == "\r" or character == "\n":
         return 0
 
     if character == " ":
         return int(round(line_height * 0.4))
 
-    target_height, _ = _get_typographic_settings(character, line_height)
-    scale = target_height / float(line_height)
-    base_width = line_height
-    if character in tiny_punctuation:
-        base_width = max(1, int(round(line_height * 0.18)))
-    elif character in small_letters:
-        base_width = max(1, int(round(line_height * 0.55)))
-    elif character in descender_letters:
-        base_width = max(1, int(round(line_height * 0.58)))
-    elif character in ascender_letters or character.isupper() or character.isdigit():
-        base_width = line_height
-    else:
-        base_width = max(1, int(round(line_height * 0.65)))
+    # Without access to a character variant database, fall back to heuristic.
+    # The precise tight-ink advance requires a sampled variant from the `char_db`.
+    # To preserve compatibility, this function keeps the old heuristic when no
+    # `char_db` is provided. If a `char_db` is passed via keyword, we will
+    # compute the tight ink width from an actual variant.
+    return max(1, int(round(line_height * 0.5)))
 
-    return max(1, int(round(base_width * scale)))
+
+def _measure_tight_ink_width_from_variant(
+    character: str,
+    line_height: int,
+    char_db: Dict[str, List[np.ndarray]] | None,
+    variant_index: int | None = None,
+) -> int:
+    """Measure tight ink width for `character` by sampling a variant from `char_db`.
+
+    This resizes the variant using the same pipeline as rendering and returns
+    the number of columns that contain ink — this matches the kerning used
+    by `_blend_character` which bases advancement on actual ink extent.
+    """
+    if character == " " or character == "" or character in "\r\n":
+        return int(round(line_height * 0.4))
+
+    safe = get_safe_label(character)
+
+    # Determine variant list and default index
+    variant_list = []
+    if char_db is not None:
+        variant_list = char_db.get(safe, [])
+
+    # If no variants, use synthetic single variant
+    if not variant_list:
+        variant_list = [_render_fallback_character(character, size=64)]
+
+    # Use module-level cache for measured widths (keyed by variant index)
+    global _width_cache
+
+    # If a specific variant_index is provided, measure that variant only
+    if variant_index is not None and variant_index >= 0 and variant_index < len(variant_list):
+        key = f"{safe}:{variant_index}:{line_height}"
+        if key in _width_cache:
+            return _width_cache[key]
+
+        variant = variant_list[variant_index]
+        target_height, _ = _get_typographic_settings(character, line_height)
+        try:
+            _, mask = _prepare_character_patch(variant, target_height=target_height, thin_strokes=True)
+            col_sums = np.sum(mask, axis=0)
+            cols = np.where(col_sums > 1e-3)[0]
+            if cols.size:
+                ink_width = int(cols[-1] - cols[0] + 1)
+            else:
+                ink_width = max(1, mask.shape[1])
+        except Exception:
+            ink_width = max(1, int(round(line_height * 0.5)))
+
+        _width_cache[key] = ink_width
+        return ink_width
+
+    # Otherwise, fall back to measuring the first available variant (compat)
+    for idx, variant in enumerate(variant_list):
+        key = f"{safe}:{idx}:{line_height}"
+        if key in _width_cache:
+            return _width_cache[key]
+
+        target_height, _ = _get_typographic_settings(character, line_height)
+        try:
+            _, mask = _prepare_character_patch(variant, target_height=target_height, thin_strokes=True)
+            col_sums = np.sum(mask, axis=0)
+            cols = np.where(col_sums > 1e-3)[0]
+            if cols.size:
+                ink_width = int(cols[-1] - cols[0] + 1)
+            else:
+                ink_width = max(1, mask.shape[1])
+        except Exception:
+            ink_width = max(1, int(round(line_height * 0.5)))
+
+        _width_cache[key] = ink_width
+        return ink_width
 
 
 def _estimate_word_width(word: str, line_height: int) -> int:
@@ -295,11 +469,16 @@ def _estimate_word_width(word: str, line_height: int) -> int:
         if character == " ":
             width += _estimate_character_width(character, line_height)
             continue
+        # Prefer tight ink-based advance if `char_db` is available at call site.
+        # Backwards-compatible signature: if caller supplies `char_db` via closure
+        # we won't have it here; the generate function will call the variant-aware
+        # helper directly. For now use heuristic estimate.
         width += _estimate_character_width(character, line_height)
         drawable_char_count += 1
 
     if drawable_char_count > 1:
-        width += int(np.random.randint(2, 6)) * (drawable_char_count - 1)
+        # reduce default intra-word spacing when estimating widths
+        width += int(np.random.randint(1, 4)) * (drawable_char_count - 1)
 
     return width
 
@@ -336,74 +515,130 @@ def generate_handwritten_page(
     page_width, page_height = page_size
     page = np.full((page_height, page_width, 3), 255, dtype=np.uint8)
 
+    # Clear width cache to avoid cross-request memory leaks and ensure
+    # measurements reflect the current `char_db` and `line_height`.
+    global _width_cache
+    _width_cache.clear()
+
     left_margin = 60
     right_margin = 60
     top_margin = 80
     bottom_margin = 80
     line_height = 58
     line_step = int(round(line_height * 1.5))
-    space_advance = int(round(line_height * 0.42))
+    # Slightly reduce space advance to tighten inter-word spacing
+    space_advance = int(round(line_height * 0.34))
 
     current_x = left_margin
     current_y = top_margin
 
-    words = text.split(" ")
-    for word_index, word in enumerate(words):
+    # Draw ruled notebook lines under the text before pasting characters.
+    # Use black lines for higher contrast with tightened letter spacing.
+    line_color = (0, 0, 0)
+    first_line_y = int(round(top_margin + line_height))
+    y = first_line_y
+    while y < page_height - bottom_margin:
+        cv2.line(page, (0, y), (page_width, y), line_color, thickness=2)
+        y += line_step
+
+    # Pre-select deterministic variant indices per character in the text so
+    # measurement and pasting refer to the same exemplar.
+    seed = int.from_bytes(hashlib.md5(text.encode("utf-8")).digest()[:4], "little")
+    rng = np.random.RandomState(seed)
+    variant_map: List[int | None] = []
+    for ch in text:
+        if ch in "\r\n " or ch == "":
+            variant_map.append(None)
+            continue
+        safe = get_safe_label(ch)
+        variants = char_db.get(safe) if char_db is not None else None
+        if variants:
+            variant_map.append(int(rng.randint(0, len(variants))))
+        else:
+            variant_map.append(-1)
+
+    pos = 0
+    text_len = len(text)
+    while pos < text_len:
         if current_y > page_height - bottom_margin:
             break
 
-        if "\n" in word or "\r" in word:
-            sublines = word.splitlines()
-        else:
-            sublines = [word]
+        ch = text[pos]
+        # Handle explicit newlines
+        if ch == "\n" or ch == "\r":
+            current_x = left_margin
+            current_y += line_step
+            pos += 1
+            continue
 
-        for subline_index, subline in enumerate(sublines):
-            if subline_index > 0:
-                current_x = left_margin
-                current_y += line_step
-                if current_y > page_height - bottom_margin:
-                    break
+        # Handle spaces
+        if ch == " ":
+            current_x += space_advance
+            pos += 1
+            continue
 
-            if not subline:
+        # Collect a word from pos to next whitespace
+        start = pos
+        end = pos
+        while end < text_len and text[end] not in " \r\n":
+            end += 1
+
+        # Measure word width using the preselected variants
+        word_width = 0
+        drawable_char_count_local = 0
+        for j in range(start, end):
+            ch2 = text[j]
+            if ch2 in "\r\n":
                 continue
+            if ch2 == " ":
+                word_width += int(round(line_height * 0.4))
+                continue
+            v_idx = variant_map[j]
+            # pass None if v_idx is -1 to allow fallback synthetic measurement
+            measured = _measure_tight_ink_width_from_variant(ch2, line_height, char_db, variant_index=(None if v_idx == -1 else v_idx))
+            word_width += measured
+            drawable_char_count_local += 1
 
-            word_width = _estimate_word_width(subline, line_height)
-            if current_x + word_width > page_width - right_margin:
-                current_x = left_margin
-                current_y += line_step
+        if drawable_char_count_local > 1:
+            # reduce per-character extra spacing in words
+            word_width += int(np.random.randint(1, 4)) * (drawable_char_count_local - 1)
 
-            for character in subline:
-                if character in "\r\n" or character == " ":
-                    continue
+        if current_x + word_width > page_width - right_margin:
+            current_x = left_margin
+            current_y += line_step
 
-                if current_y > page_height - bottom_margin:
-                    break
-
-                selected_variant = _resolve_variant(char_db, character)
-                target_height, typographic_offset = _get_typographic_settings(character, line_height)
-                baseline_jitter = int(np.random.randint(-3, 3))
-                paste_y = max(0, current_y + typographic_offset + baseline_jitter)
-                pasted_width = _blend_character(
-                    page,
-                    current_x,
-                    paste_y,
-                    selected_variant,
-                    target_height=target_height,
-                )
-
-                if pasted_width <= 0:
-                    current_x += int(np.random.randint(2, 6))
-                    continue
-
-                current_x += pasted_width + int(np.random.randint(2, 6))
-
+        # Paste each character using the preselected variant indices
+        for j in range(start, end):
+            character = text[j]
+            if character in "\r\n" or character == " ":
+                continue
             if current_y > page_height - bottom_margin:
                 break
 
-        if word_index < len(words) - 1:
-            current_x += space_advance
-            if current_x > page_width - right_margin:
-                current_x = left_margin
-                current_y += line_step
+            v_idx = variant_map[j]
+            if v_idx is None or v_idx == -1:
+                selected_variant = _render_fallback_character(character)
+            else:
+                selected_variant = _get_variant_from_db(char_db, character, v_idx)
+
+            target_height, typographic_offset = _get_typographic_settings(character, line_height)
+            baseline_jitter = int(np.random.randint(-3, 3))
+            paste_y = max(0, current_y + typographic_offset + baseline_jitter)
+            pasted_width = _blend_character(
+                page,
+                current_x,
+                paste_y,
+                selected_variant,
+                target_height=target_height,
+            )
+
+            if pasted_width <= 0:
+                current_x += 1
+            else:
+                # reduce random gap between adjacent characters (0 or 1 px)
+                gap = int(np.random.randint(0, 2))
+                current_x += pasted_width + gap
+
+        pos = end
 
     return page

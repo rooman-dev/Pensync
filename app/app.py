@@ -500,7 +500,14 @@ def _build_character_database_from_processed_images(text: str) -> dict[str, List
             if not label_dir.is_dir():
                 continue
             label = label_dir.name
-            if label not in allowed_characters and not label.startswith("sym_"):
+            # Accept raw single-character labels, symbol safe-labels, and the
+            # case-aware safe-labels introduced by the compositor (upper_/lower_)
+            if (
+                label not in allowed_characters
+                and not label.startswith("sym_")
+                and not label.startswith("upper_")
+                and not label.startswith("lower_")
+            ):
                 continue
             for img_path in sorted(label_dir.glob("*.png")):
                 try:
