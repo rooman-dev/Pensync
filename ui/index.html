@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Pensync V2</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary navigation">
+        <div class="brand">
+          <div class="brand-mark">P</div>
+          <div class="brand-copy">
+            <div class="brand-name">Pensync</div>
+            <div class="brand-subtitle">V2 Control Surface</div>
+          </div>
+        </div>
+
+        <nav class="nav">
+          <a class="nav-item nav-item-active" href="#dashboard" data-view-target="dashboard">Dashboard</a>
+          <a class="nav-item" href="#verification" data-view-target="verification">Verification (HITL)</a>
+          <a class="nav-item" href="#compositor" data-scroll-target="#compositor">Compositor</a>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div class="footer-label">Backend</div>
+          <div class="footer-value">Python pipeline connected</div>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div>
+            <h1>Pensync V2</h1>
+            <p>Static UI shell for the new desktop frontend.</p>
+          </div>
+
+          <div class="topbar-status" aria-label="System status">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span>Ready</span>
+          </div>
+        </header>
+
+        <section class="content-area">
+          <div id="view-dashboard" class="view-section">
+            <article class="card" id="dashboard">
+              <div class="card-header">
+                <h2>Dashboard</h2>
+                <span class="card-badge">Overview</span>
+              </div>
+              <p>
+                Placeholder panel for ingestion summary, label distribution, and generator
+                health metrics.
+              </p>
+              <div class="card-grid">
+                <div class="metric">
+                  <span class="metric-label">Processed</span>
+                  <strong id="stat-processed">—</strong>
+                </div>
+                <div class="metric">
+                  <span class="metric-label">Unique Characters</span>
+                  <strong id="stat-unique">—</strong>
+                </div>
+                <div class="metric">
+                  <span class="metric-label">Total Variants</span>
+                  <strong id="stat-variants">—</strong>
+                </div>
+              </div>
+            </article>
+
+            <article class="card" id="compositor">
+              <div class="card-header">
+                <h2>Compositor</h2>
+                <span class="card-badge">Rendering</span>
+              </div>
+              <p>
+                Placeholder panel for typographic controls, page synthesis settings, and
+                export actions.
+              </p>
+              <div class="control-row">
+                <button class="button button-primary" type="button">Generate Page</button>
+                <button class="button" type="button">Export PNG</button>
+              </div>
+            </article>
+          </div>
+
+          <div id="view-verification" class="view-section hidden">
+            <article class="card">
+              <div class="card-header">
+                <h2>Verification (HITL)</h2>
+                <span class="card-badge card-badge-success">Rapid-Fire Grid</span>
+              </div>
+              <p>
+                Review CNN predictions quickly. Press <span class="shortcut">Y</span> to approve or
+                <span class="shortcut">N</span> to reject the active card.
+              </p>
+              <div id="verification-grid" class="verification-grid" aria-live="polite"></div>
+              <div id="verification-empty" class="verification-empty hidden">
+                No pending verification items.
+              </div>
+            </article>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+    document.addEventListener('pywebviewready', () => {
+      const dashboardLink = document.querySelector('a[data-view-target="dashboard"]');
+      const verificationLink = document.querySelector('a[data-view-target="verification"]');
+      const compositorLink = document.querySelector('a[data-scroll-target="#compositor"]');
+      const dashboardView = document.getElementById('view-dashboard');
+      const verificationView = document.getElementById('view-verification');
+      const verificationGrid = document.getElementById('verification-grid');
+      const verificationEmpty = document.getElementById('verification-empty');
+      const statUnique = document.getElementById('stat-unique');
+      const statVariants = document.getElementById('stat-variants');
+      const navItems = Array.from(document.querySelectorAll('.nav-item'));
+
+      let verificationCards = [];
+      let activeVerificationIndex = 0;
+      let activeView = 'dashboard';
+
+      const setActiveNav = (targetView) => {
+        navItems.forEach((item) => {
+          item.classList.remove('nav-item-active');
+        });
+
+        const activeItem = document.querySelector(`.nav-item[data-view-target="${targetView}"]`);
+        if (activeItem) {
+          activeItem.classList.add('nav-item-active');
+        }
+      };
+
+      const showView = (viewName) => {
+        activeView = viewName;
+        const isDashboard = viewName === 'dashboard';
+        dashboardView.classList.toggle('hidden', !isDashboard);
+        verificationView.classList.toggle('hidden', isDashboard);
+        setActiveNav(viewName);
+      };
+
+      const loadDashboardStats = async () => {
+        if (!window.pywebview || !window.pywebview.api) {
+          return;
+        }
+
+        try {
+          const stats = await window.pywebview.api.get_dashboard_stats();
+          if (statUnique) {
+            statUnique.textContent = String(stats.unique_chars ?? 0);
+          }
+          if (statVariants) {
+            statVariants.textContent = String(stats.total_variants ?? 0);
+          }
+        } catch (error) {
+          console.error('Failed to load dashboard stats:', error);
+        }
+      };
+
+      const setVerificationEmptyState = () => {
+        if (!verificationGrid || !verificationEmpty) {
+          return;
+        }
+
+        const hasCards = verificationCards.length > 0;
+        verificationGrid.classList.toggle('hidden', !hasCards);
+        verificationEmpty.classList.toggle('hidden', hasCards);
+      };
+
+      const updateActiveCardState = () => {
+        verificationCards.forEach((card, index) => {
+          card.element.classList.toggle('verification-card-active', index === activeVerificationIndex);
+        });
+      };
+
+      const renderVerificationGrid = () => {
+        if (!verificationGrid) {
+          return;
+        }
+
+        verificationGrid.innerHTML = '';
+
+        verificationCards.forEach((item, index) => {
+          const card = document.createElement('article');
+          card.className = 'verification-card';
+          card.dataset.filename = item.id;
+          card.dataset.label = item.label;
+          card.dataset.index = String(index);
+
+          card.innerHTML = `
+            <div class="verification-image-wrap">
+              <img class="verification-image" src="data:${item.mime_type};base64,${item.image_base64}" alt="Pending character ${item.id}" />
+            </div>
+            <div class="verification-meta">
+              <span class="verification-label">${item.label}</span>
+              <span class="verification-filename">${item.id}</span>
+            </div>
+          `;
+
+          verificationGrid.appendChild(card);
+          item.element = card;
+        });
+
+        setVerificationEmptyState();
+        updateActiveCardState();
+      };
+
+      const loadVerificationQueue = async () => {
+        if (!window.pywebview || !window.pywebview.api) {
+          renderVerificationGrid();
+          return;
+        }
+
+        try {
+          const queue = await window.pywebview.api.get_verification_queue();
+          verificationCards = (queue || []).map((item) => ({
+            id: item.id,
+            label: item.label,
+            image_base64: item.image_base64,
+            mime_type: (item.id || '').toLowerCase().endsWith('.jpg') || (item.id || '').toLowerCase().endsWith('.jpeg')
+              ? 'image/jpeg'
+              : (item.id || '').toLowerCase().endsWith('.webp')
+                ? 'image/webp'
+                : (item.id || '').toLowerCase().endsWith('.bmp')
+                  ? 'image/bmp'
+                  : 'image/png',
+          }));
+          activeVerificationIndex = 0;
+          renderVerificationGrid();
+        } catch (error) {
+          console.error('Failed to load verification queue:', error);
+          verificationCards = [];
+          renderVerificationGrid();
+        }
+      };
+
+      const resolveActiveVerification = async (action) => {
+        if (!verificationCards.length || activeVerificationIndex < 0 || activeVerificationIndex >= verificationCards.length) {
+          return;
+        }
+
+        const activeItem = verificationCards[activeVerificationIndex];
+
+        if (!window.pywebview || !window.pywebview.api) {
+          return;
+        }
+
+        try {
+          const result = await window.pywebview.api.resolve_verification(activeItem.id, activeItem.label, action);
+          if (!result || result.ok === false) {
+            console.error('Resolution failed:', result && result.error ? result.error : 'Unknown error');
+            return;
+          }
+
+          verificationCards.splice(activeVerificationIndex, 1);
+          if (activeVerificationIndex >= verificationCards.length) {
+            activeVerificationIndex = Math.max(0, verificationCards.length - 1);
+          }
+          renderVerificationGrid();
+        } catch (error) {
+          console.error('resolve_verification failed:', error);
+        }
+      };
+
+      if (dashboardLink) {
+        dashboardLink.addEventListener('click', (event) => {
+          event.preventDefault();
+          showView('dashboard');
+        });
+      }
+
+      if (verificationLink) {
+        verificationLink.addEventListener('click', async (event) => {
+          event.preventDefault();
+          showView('verification');
+          await loadVerificationQueue();
+        });
+      }
+
+      if (compositorLink) {
+        compositorLink.addEventListener('click', (event) => {
+          event.preventDefault();
+          showView('dashboard');
+          document.getElementById('compositor')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
+      }
+
+      document.addEventListener('keydown', async (event) => {
+        const key = event.key.toLowerCase();
+        if (activeView !== 'verification') {
+          return;
+        }
+
+        if (key === 'y' || key === 'n') {
+          event.preventDefault();
+          await resolveActiveVerification(key === 'y' ? 'approve' : 'reject');
+        }
+      });
+
+      showView('dashboard');
+      loadDashboardStats();
+    });
+    </script>
+  </body>
+</html>
